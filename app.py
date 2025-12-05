@@ -12,8 +12,6 @@ from datetime import datetime
 st.set_page_config(page_title="AI Language Tutor", page_icon="🚀", layout="wide")
 
 def get_db_connection():
-    # 注意：在 Streamlit Cloud 上，SQLite 数据库是临时的（重启会重置）
-    # 如果需要永久保存，建议后续升级为 Google Sheets 或 Supabase
     conn = sqlite3.connect("web_language_brain.db")
     return conn
 
@@ -33,53 +31,106 @@ init_db()
 # 初始化 Session State
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "current_model_name" not in st.session_state:
+    st.session_state.current_model_name = None
 
 # ==========================================
-# 2. 侧边栏 & API Key 配置 (关键修改)
+# 2. 智能模型选择函数 (核心更新)
+# ==========================================
+def get_best_available_model():
+    """
+    自动寻找当前 API Key 可用的最佳模型。
+    优先级: 1.5-Flash -> 1.5-Pro -> 1.0-Pro
+    """
+    try:
+        # 获取所有支持 generateContent 的模型
+        model_list = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                model_list.append(m.name)
+        
+        # 打印出来方便调试（在终端可以看到）
+        print(f"Available models: {model_list}")
+
+        # 优先级逻辑
+        # 1. 优先尝试 Flash (速度最快)
+        for m in model_list:
+            if "flash" in m and "1.5" in m: return m
+        
+        # 2. 其次尝试 1.5 Pro (效果最好)
+        for m in model_list:
+            if "pro" in m and "1.5" in m: return m
+            
+        # 3. 保底尝试任何带 gemini 的模型
+        for m in model_list:
+            if "gemini" in m: return m
+            
+        # 4. 如果还没找到，返回默认值碰碰运气
+        return "models/gemini-1.5-flash"
+        
+    except Exception as e:
+        # 如果列出模型失败（比如 Key 只有特定权限），返回一个保守的默认值
+        print(f"Error listing models: {e}")
+        return "models/gemini-pro"
+
+# ==========================================
+# 3. 侧边栏 & 设置
 # ==========================================
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # 优先尝试从 Streamlit Secrets 读取 Key
+    # 获取 API Key
     api_key = None
     if "GOOGLE_API_KEY" in st.secrets:
         api_key = st.secrets["GOOGLE_API_KEY"]
-        st.success("✅ API Key loaded from Cloud Secrets")
+        st.success("✅ Cloud Key Loaded")
     else:
-        # 如果本地运行且没有配置 secrets.toml，允许手动输入
-        api_key = st.text_input("Google API Key", type="password", help="Enter your key here for local testing")
+        api_key = st.text_input("Google API Key", type="password")
 
-    # 配置 Google Gemini
+    # 配置 Google Gemini 并自动选模型
+    model = None
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
-        genai.configure(api_key=api_key)
+        try:
+            genai.configure(api_key=api_key)
+            
+            # === 自动选择模型 ===
+            if not st.session_state.current_model_name:
+                with st.spinner("🤖 Finding the best model for you..."):
+                    best_model = get_best_available_model()
+                    st.session_state.current_model_name = best_model
+            
+            # 显示当前使用的模型
+            st.info(f"🧠 Model: `{st.session_state.current_model_name}`")
+            
+            # 实例化模型
+            model = genai.GenerativeModel(st.session_state.current_model_name)
+            
+        except Exception as e:
+            st.error(f"Config Error: {e}")
     else:
-        st.warning("⚠️ Please configure your API Key in Streamlit Secrets or enter it above.")
+        st.warning("⚠️ Please enter API Key")
 
     st.divider()
     
     # 语言选择
     language = st.selectbox("Target Language", ["German", "Spanish", "English", "French"])
     
-    # 读取用户等级
+    # 读取数据
     conn = get_db_connection()
     level_row = conn.cursor().execute("SELECT level FROM user_levels WHERE language=?", (language,)).fetchone()
     current_level = level_row[0] if level_row else "A1"
-    
-    # 读取词汇量
     vocab_count = conn.cursor().execute("SELECT count(*) FROM vocab WHERE language=?", (language,)).fetchone()[0]
     conn.close()
     
     st.metric(f"{language} Level", current_level)
-    st.caption(f"📚 Vocab stored: {vocab_count}")
 
 # ==========================================
-# 3. 核心功能函数
+# 4. 功能函数
 # ==========================================
-model = genai.GenerativeModel('gemini-1.5-flash')
-
 def extract_vocab_in_background(text, lang):
-    """从生成的文本中提取单词"""
+    """提取单词"""
+    if not model: return []
     prompt = f"""
     Extract 5 key vocabulary words (lemmatized) from the following {lang} text.
     Output JSON ONLY: ["word1", "word2", "word3", "word4", "word5"]
@@ -122,59 +173,59 @@ def update_level(lang, direction):
     return new_lvl
 
 # ==========================================
-# 4. 主聊天界面
+# 5. 主界面
 # ==========================================
-st.title("🚀 Cloud AI Language Tutor")
-st.caption(f"Status: Learning {language} at {current_level} level")
+st.title("🚀 Auto-Model AI Tutor")
 
-# 如果没有 Key，停止运行并提示
 if not api_key:
-    st.info("👋 Please add your Google API Key to start.")
     st.stop()
 
-# 聊天输入框
-topic = st.chat_input(f"What do you want to learn in {language}? (e.g. Coffee, Coding)")
+topic = st.chat_input(f"What do you want to learn in {language}?")
 
 if topic:
     # 1. 显示用户输入
     with st.chat_message("user"):
         st.write(topic)
     
-    # 2. AI 生成回答 (手动流式处理，兼容性最强)
+    # 2. AI 生成 (手动流式)
     with st.chat_message("assistant"):
         response_placeholder = st.empty()
         full_response = ""
         
-        try:
-            prompt = f"""
-            Write a short, engaging lesson about '{topic}' in {language} for a {current_level} level student.
-            Include the English translation at the end.
-            DO NOT use JSON. Just write natural text.
-            """
-            
-            response_stream = model.generate_content(prompt, stream=True)
-            
-            # 手动循环读取，确保有内容就显示
-            for chunk in response_stream:
-                if chunk.text:
-                    full_response += chunk.text
-                    response_placeholder.markdown(full_response + "▌")
-            
-            # 完成后显示最终文本
-            response_placeholder.markdown(full_response)
-            
-            # 3. 后台提取单词
-            if full_response:
-                with st.status("🧠 Processing vocabulary...", expanded=False) as status:
-                    new_words = extract_vocab_in_background(full_response, language)
-                    status.update(label=f"Saved {len(new_words)} new words!", state="complete", expanded=False)
-                    if new_words:
-                        st.write(f"Added: `{'`, `'.join(new_words)}`")
-                        
-        except Exception as e:
-            response_placeholder.error(f"❌ Error: {e}")
+        if model:
+            try:
+                prompt = f"""
+                Write a short, engaging lesson about '{topic}' in {language} for a {current_level} level student.
+                Include the English translation at the end.
+                DO NOT use JSON. Just write natural text.
+                """
+                
+                # 尝试生成
+                response_stream = model.generate_content(prompt, stream=True)
+                
+                for chunk in response_stream:
+                    if chunk.text:
+                        full_response += chunk.text
+                        response_placeholder.markdown(full_response + "▌")
+                
+                response_placeholder.markdown(full_response)
+                
+                # 3. 提取单词
+                if full_response:
+                    with st.status("🧠 Processing vocabulary...", expanded=False) as status:
+                        new_words = extract_vocab_in_background(full_response, language)
+                        status.update(label=f"Saved {len(new_words)} words!", state="complete", expanded=False)
+                        if new_words:
+                            st.write(f"Added: `{'`, `'.join(new_words)}`")
+                            
+            except Exception as e:
+                # 即使模型选择失败，这里也能捕获到
+                response_placeholder.error(f"❌ Error: {e}")
+                st.error("Tip: Check if your API Key has access to the selected model.")
+        else:
+            st.error("Model not initialized.")
 
-    # 4. 难度反馈按钮
+    # 4. 反馈按钮
     st.write("---")
     c1, c2, c3 = st.columns(3)
     if c1.button("Too Easy (⬆️ Level Up)"):
@@ -189,10 +240,3 @@ if topic:
         nl = update_level(language, "down")
         st.toast(f"Level down! Now {nl}")
         import time; time.sleep(0.5); st.rerun()
-
-# 历史生词展示
-if st.checkbox("Show Vocabulary Bank"):
-    conn = get_db_connection()
-    df = pd.read_sql_query(f"SELECT word, proficiency FROM vocab WHERE language='{language}' ORDER BY last_reviewed DESC LIMIT 20", conn)
-    conn.close()
-    st.dataframe(df, use_container_width=True)

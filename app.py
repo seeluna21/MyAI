@@ -4,9 +4,10 @@ import sqlite3
 import json
 import os
 import pandas as pd
+import re  # <--- 新增：用于正则清洗文本
 from datetime import datetime
-from gtts import gTTS  # <--- 新增：文本转语音库
-from io import BytesIO # <--- 新增：内存文件处理
+from gtts import gTTS
+from io import BytesIO
 
 # ==========================================
 # 1. 基础配置 & 数据库
@@ -35,7 +36,7 @@ if "current_model_name" not in st.session_state:
     st.session_state.current_model_name = None
 
 # ==========================================
-# 2. 智能模型选择 & TTS 工具
+# 2. 智能模型选择 & 工具函数
 # ==========================================
 def get_best_available_model():
     """自动寻找最佳模型"""
@@ -45,7 +46,6 @@ def get_best_available_model():
             if 'generateContent' in m.supported_generation_methods:
                 model_list.append(m.name)
         
-        # 优先级：Flash -> Pro -> Basic
         for m in model_list:
             if "flash" in m and "1.5" in m: return m
         for m in model_list:
@@ -56,7 +56,23 @@ def get_best_available_model():
     except Exception as e:
         return "models/gemini-pro"
 
-# 语言代码映射 (用于语音合成)
+# === 新增：TTS 文本清洗函数 ===
+def clean_text_for_tts(text):
+    """
+    去除 Markdown 符号，只保留纯文本供朗读。
+    比如把 "**Hello**" 变成 "Hello"。
+    """
+    # 1. 去除加粗和斜体符号 (* 或 **)
+    text = text.replace('**', '').replace('*', '')
+    # 2. 去除标题符号 (#)
+    text = text.replace('##', '').replace('#', '')
+    # 3. 去除代码块符号 (`)
+    text = text.replace('`', '')
+    # 4. 去除列表开头的横杠 (- )，替换为逗号以增加停顿
+    text = re.sub(r'^\s*-\s+', '', text, flags=re.MULTILINE)
+    
+    return text.strip()
+
 LANG_CODES = {
     "German": "de",
     "Spanish": "es",
@@ -99,13 +115,12 @@ with st.sidebar:
     conn = get_db_connection()
     level_row = conn.cursor().execute("SELECT level FROM user_levels WHERE language=?", (language,)).fetchone()
     current_level = level_row[0] if level_row else "A1"
-    vocab_count = conn.cursor().execute("SELECT count(*) FROM vocab WHERE language=?", (language,)).fetchone()[0]
     conn.close()
     
     st.metric(f"{language} Level", current_level)
 
 # ==========================================
-# 4. 功能函数
+# 4. 核心功能
 # ==========================================
 def extract_vocab_in_background(text, lang):
     if not model: return []
@@ -167,11 +182,15 @@ if topic:
         
         if model:
             try:
-                # 提示词微调：让它把外语放前面，翻译放后面，这样听起来比较连贯
+                # 提示词优化：让 AI 知道它是为了朗读而写的
                 prompt = f"""
                 Write a short, engaging lesson about '{topic}' in {language} for a {current_level} level student.
-                IMPORTANT: Write the full {language} text FIRST. Then add the English translation at the very bottom.
-                DO NOT use JSON. Just write natural text.
+                Format: 
+                1. The full {language} text.
+                2. Then a separator line.
+                3. The English translation.
+                
+                DO NOT use JSON. Write natural text.
                 """
                 
                 response_stream = model.generate_content(prompt, stream=True)
@@ -183,20 +202,18 @@ if topic:
                 
                 response_placeholder.markdown(full_response)
                 
-                # === 新增：生成语音 (TTS) ===
+                # === 修复点：先清洗，再朗读 ===
                 if full_response:
-                    with st.spinner("🔊 Generating audio..."):
-                        # 获取对应的语言代码 (例如 German -> de)
+                    with st.spinner("🔊 Generating clean audio..."):
+                        # 1. 清洗掉 markdown 符号
+                        clean_text = clean_text_for_tts(full_response)
+                        
+                        # 2. 生成语音
                         lang_code = LANG_CODES.get(language, 'en')
+                        tts = gTTS(text=clean_text, lang=lang_code, slow=False)
                         
-                        # 创建语音对象
-                        tts = gTTS(text=full_response, lang=lang_code, slow=False)
-                        
-                        # 写入内存 (不存硬盘，速度快)
                         sound_file = BytesIO()
                         tts.write_to_fp(sound_file)
-                        
-                        # 显示播放器
                         st.audio(sound_file, format='audio/mp3')
 
                 # 提取单词

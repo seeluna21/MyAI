@@ -1,4 +1,5 @@
 streamlit
 google-generativeai
 pandas
-gTTS
+edge-tts
+Pillow

@@ -27,7 +27,7 @@
 
 1. **Clone the repository**
    ```bash
-   git clone [https://github.com/your-username/ai-language-tutor.git](https://github.com/your-username/ai-language-tutor.git)
+   git clone [https://github.com/seeluna21/MyAI.git](https://github.com/seeluna21/MyAI.git)
    cd ai-language-tutor
    ```
 

@@ -17,7 +17,8 @@ from PIL import Image
 st.set_page_config(page_title="AI Omni-Tutor", page_icon="🦄", layout="wide")
 
 def get_db_connection():
-    conn = sqlite3.connect("web_language_brain.db")
+    conn = sqlite3.connect("web_language_brain_v3.db")
+    # conn = sqlite3.connect("web_language_brain.db")
     return conn
 
 def init_db():

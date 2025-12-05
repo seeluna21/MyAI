@@ -76,7 +76,7 @@ def clean_text_for_tts(text):
 # 2.3 智能模型选择
 def get_best_model():
     # 简单粗暴：直接用 Flash，它现在支持 Vision 且速度快
-    return "models/gemini-1.5-flash"
+    return "models/gemini-2.5-flash"
 
 # ==========================================
 # 3. 侧边栏设置

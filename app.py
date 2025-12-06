@@ -13,7 +13,7 @@ from gtts import gTTS
 # ==========================================
 # 0. 基础配置
 # ==========================================
-st.set_page_config(page_title="AI Omni-Tutor V7.6 (Audio History)", page_icon="🦄", layout="wide")
+st.set_page_config(page_title="AI Omni-Tutor V7.7 (Translator)", page_icon="🦄", layout="wide")
 
 # ==========================================
 # 1. 数据库逻辑
@@ -50,9 +50,8 @@ LANG_CODE_MAP = {
 def generate_audio_bytes(text, lang_name):
     """生成音频数据的 BytesIO 对象"""
     try:
-        # 只读取翻译前的外语部分，避免把中文翻译也读出来
-        # 简单的逻辑：读取第一行或者直到遇到翻译标记前的内容
-        speak_text = text.split("🇨🇳")[0].strip() # 避免读出后面的中文翻译
+        # ⚠️ 修改：切割符改为 🇺🇸，只读翻译前的目标语言部分
+        speak_text = text.split("🇺🇸")[0].strip() 
         if not speak_text: speak_text = text
 
         lang_code = LANG_CODE_MAP.get(lang_name, "en")
@@ -69,14 +68,11 @@ def generate_audio_bytes(text, lang_name):
 def make_audio_html(audio_fp, autoplay=False):
     """
     将音频数据转换为 HTML 字符串。
-    autoplay=True: 用于刚生成时自动播放
-    autoplay=False: 用于存入历史记录，避免刷新页面时所有历史语音同时炸响
     """
     if not audio_fp: return ""
     try:
         b64 = base64.b64encode(audio_fp.getvalue()).decode()
         autoplay_attr = "autoplay" if autoplay else ""
-        # 构建一个带有控件的 HTML 播放器
         return f"""
             <audio controls {autoplay_attr} style="width: 100%; margin-top: 5px;">
             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
@@ -89,12 +85,11 @@ def make_audio_html(audio_fp, autoplay=False):
 # 3. 其他工具函数
 # ==========================================
 def get_model():
-    # ⚠️ 修正：必须使用存在的模型版本
     return "models/gemini-2.5-flash" 
 
 def extract_and_save_vocab(text, lang, model):
     try:
-        # 优化 Prompt，让提取更精准
+        # ⚠️ Prompt 修改：明确要求 English Translation
         prompt = f"""
         Analyze this {lang} text. Identify 3-5 key vocabulary words.
         Output ONLY a raw JSON list. 
@@ -115,7 +110,7 @@ def extract_and_save_vocab(text, lang, model):
         conn = get_db_connection()
         today_dt = datetime.now()
         
-        # ⚠️ 修改：days=0，表示今天就可以复习！
+        # 立即复习 (days=0)
         next_review = today_dt.strftime("%Y-%m-%d")
         
         saved_words = []
@@ -148,7 +143,7 @@ with st.sidebar:
         try:
             model = genai.GenerativeModel(get_model())
         except:
-            st.error("API Key Error or Model unavailable")
+            st.error("API Key Error")
             st.stop()
     else:
         st.warning("Please setup API Key")
@@ -183,7 +178,14 @@ with st.sidebar:
     st.metric("Review Due", f"{review_count} words")
     st.divider()
     
-    scenarios = {"☕ Cafe": "Barista", "🛃 Customs": "Officer", "🤝 Friend": "Student", "🤖 Free Chat": "Tutor"}
+    # ⚠️ 新增 Translator 选项
+    scenarios = {
+        "🔤 Translator": "Translator",
+        "☕ Cafe": "Barista",
+        "🛃 Customs": "Officer",
+        "🤝 Friend": "Student",
+        "🤖 Free Chat": "Tutor"
+    }
     current_scenario = st.radio("Context:", list(scenarios.keys()))
     
     if current_scenario != st.session_state.current_scenario:
@@ -201,21 +203,24 @@ with st.sidebar:
 st.title(f"🦄 AI Tutor: {language} ({selected_level})")
 tab1, tab2, tab3 = st.tabs(["💬 Chat & Learn", "📸 Photo Learning", "🧠 Review"])
 
-# --- TAB 1: 聊天 ---
+# --- TAB 1: 聊天/翻译 ---
 with tab1:
     chat_container = st.container()
     
-    # 1. 渲染历史消息 (包含音频播放器)
     with chat_container:
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-                # 如果历史消息里有音频HTML，就显示出来
                 if "audio_html" in msg and msg["audio_html"]:
                     st.markdown(msg["audio_html"], unsafe_allow_html=True)
         st.empty() 
 
-    if user_input := st.chat_input(f"Type in {language}..."):
+    # 动态调整输入框的提示语
+    input_placeholder = f"Type in {language}..."
+    if scenarios[current_scenario] == "Translator":
+        input_placeholder = "Type any word/sentence to translate..."
+
+    if user_input := st.chat_input(input_placeholder):
         st.session_state.messages.append({"role": "user", "content": user_input})
         with chat_container:
             with st.chat_message("user"):
@@ -227,18 +232,33 @@ with tab1:
                 full_response = ""
                 
                 try:
-                    # === Prompt 修改: 强制要求翻译 ===
-                    prompt = f"""
-                    Act as a {scenarios[current_scenario]}. Language: {language} ({selected_level}).
-                    User says: "{user_input}".
-                    
-                    Structure your reply exactly like this:
-                    1. Natural reply in {language} (2-3 sentences).
-                    2. New line.
-                    3. "🇨🇳 Translation: " followed by the Chinese translation.
-                    4. New line.
-                    5. If user made grammar mistakes, list corrections inside (parentheses).
-                    """
+                    # === Prompt 分流逻辑 ===
+                    if scenarios[current_scenario] == "Translator":
+                        # 翻译模式 Prompt
+                        prompt = f"""
+                        Act as a professional translator. Target Language: {language} ({selected_level}).
+                        User Input: "{user_input}"
+                        
+                        Task: Translate the user's input (which could be in any language) into natural, native-sounding {language}.
+                        
+                        Structure your reply exactly like this:
+                        1. The translation in {language} (just the text).
+                        2. New line.
+                        3. "🇺🇸 Translation: " followed by the English meaning.
+                        """
+                    else:
+                        # 角色扮演/聊天模式 Prompt
+                        prompt = f"""
+                        Act as a {scenarios[current_scenario]}. Language: {language} ({selected_level}).
+                        User says: "{user_input}".
+                        
+                        Structure your reply exactly like this:
+                        1. Natural reply in {language} (2-3 sentences).
+                        2. New line.
+                        3. "🇺🇸 Translation: " followed by the English translation.
+                        4. New line.
+                        5. If user made grammar mistakes, list corrections inside (parentheses).
+                        """
                     
                     response = model.generate_content(prompt, stream=True)
                     
@@ -248,31 +268,24 @@ with tab1:
                             placeholder.markdown(full_response + "▌")
                     placeholder.markdown(full_response)
                     
-                    # === 音频生成与保存逻辑 ===
-                    # 1. 生成音频数据
+                    # === 音频处理 ===
                     audio_bytes = generate_audio_bytes(full_response, language)
-                    
-                    # 2. 生成两种 HTML 播放器代码
-                    #    - audio_html_autoplay: 用于刚才这一刻自动播放
-                    #    - audio_html_store: 用于存入历史记录 (不自动播放)
                     audio_html_autoplay = make_audio_html(audio_bytes, autoplay=True)
                     audio_html_store = make_audio_html(audio_bytes, autoplay=False)
                     
-                    # 3. 立即播放
                     if audio_html_autoplay:
                         st.markdown(audio_html_autoplay, unsafe_allow_html=True)
                     
-                    # 4. 将消息和音频HTML存入 Session State
                     st.session_state.messages.append({
                         "role": "assistant", 
                         "content": full_response,
-                        "audio_html": audio_html_store # 存入不带自动播放的HTML
+                        "audio_html": audio_html_store
                     })
 
-                    # 5. 存词
+                    # 存词
                     new_words = extract_and_save_vocab(full_response, language, model)
                     if new_words:
-                        st.toast(f"💾 Saved for Review: {', '.join(new_words)}", icon="🧠")
+                        st.toast(f"💾 Saved: {', '.join(new_words)}", icon="🧠")
 
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -287,9 +300,10 @@ with tab2:
         if st.button("🔍 Analyze Photo"):
             with st.spinner("🤖 Analyzing..."):
                 try:
+                    # 📸 拍照 Prompt 也改成英文翻译
                     prompt = f"""
                     Describe this image in {language} (Level {selected_level}).
-                    Then provide a Chinese translation starting with "🇨🇳 Translation:".
+                    Then provide an English translation starting with "🇺🇸 Translation:".
                     Finally list 3 key vocabulary words.
                     """
                     response = model.generate_content([prompt, image])
@@ -317,7 +331,6 @@ with tab3:
         conn = get_db_connection()
         today_str = datetime.now().strftime("%Y-%m-%d")
         try:
-            # 修改查询逻辑：只要是今天之前的，或者是NULL的都查出来
             rows = conn.cursor().execute(
                 "SELECT word, translation, proficiency FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL) ORDER BY random() LIMIT 10", 
                 (language, today_str)).fetchall()
@@ -373,4 +386,4 @@ with tab3:
             if b2.button("😐 Hard", use_container_width=True): update_word(1)
             if b3.button("😎 Easy", use_container_width=True): update_word(2)
     else:
-        st.success("🎉 You are all caught up! (Chat more to get new words)")
+        st.success("🎉 You are all caught up!")

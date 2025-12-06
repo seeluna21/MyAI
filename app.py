@@ -11,14 +11,16 @@ from io import BytesIO
 from PIL import Image
 
 # ==========================================
-# 1. 基础配置 & 数据库
+# 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="AI Omni-Tutor V4", page_icon="🦄", layout="wide")
+st.set_page_config(page_title="AI Omni-Tutor V5", page_icon="🦄", layout="wide")
 
+# ==========================================
+# 2. 数据库 (自动修复冲突)
+# ==========================================
 def get_db_connection():
-    # 强制使用新数据库，避免结构冲突
-    conn = sqlite3.connect("web_language_brain_v4.db") 
-    return conn
+    # 强制使用 v5 新数据库，解决 'no such column' 报错
+    return sqlite3.connect("web_language_brain_v5.db")
 
 def init_db():
     conn = get_db_connection()
@@ -40,18 +42,19 @@ if "show_answer" not in st.session_state: st.session_state.show_answer = False
 if "current_scenario" not in st.session_state: st.session_state.current_scenario = "Free Chat"
 
 # ==========================================
-# 2. 核心工具函数
+# 3. 核心功能 (语音 & 模型)
 # ==========================================
 
-# 2.1 Edge TTS
+# 3.1 语音生成 (带防崩溃保护)
 VOICE_MAP = {
-    "German": "de-DE-KatjaNeural",    
-    "Spanish": "es-ES-AlvaroNeural",  
-    "English": "en-US-AriaNeural",    
-    "French": "fr-FR-DeniseNeural"    
+    "German": "de-DE-KatjaNeural",
+    "Spanish": "es-ES-AlvaroNeural",
+    "English": "en-US-AriaNeural",
+    "French": "fr-FR-DeniseNeural"
 }
 
 async def generate_audio_edge(text, lang):
+    """使用 Edge TTS 生成语音流 (带错误捕获)"""
     try:
         voice = VOICE_MAP.get(lang, "en-US-AriaNeural")
         communicate = edge_tts.Communicate(text, voice)
@@ -62,255 +65,165 @@ async def generate_audio_edge(text, lang):
         mp3_fp.seek(0)
         return mp3_fp
     except Exception as e:
+        # 如果报错（比如没开VPN），返回 None，不让程序崩溃
         print(f"TTS Error: {e}")
         return None
 
-# 2.2 文本清洗
+# 3.2 文本清洗
 def clean_text_for_tts(text):
-    # 去除括号里的纠错内容，只读正文
-    text = re.sub(r'\(.*?\)', '', text) 
+    text = re.sub(r'\(.*?\)', '', text) # 去掉括号里的纠错
     text = text.replace('**', '').replace('*', '').replace('`', '')
     return text.strip()
 
-# 2.3 提取单词 (后台静默运行)
-def extract_and_save_vocab(text, lang):
+# 3.3 自动寻找可用模型 (解决 404 问题)
+def get_working_model():
     try:
-        # 使用简单的正则或 prompt 提取，这里为了速度不阻塞对话，建议只提取关键词
-        # 实际生产中可以异步调用，这里为了演示保留同步但放在 status 框里
-        model = genai.GenerativeModel("models/gemini-2.5-flash")
-        prompt = f"""
-        Extract 3 difficult vocabulary words from this {lang} text.
-        Output JSON ONLY: [{{"word": "word1", "trans": "english_meaning"}}]
-        Text: {text}
-        """
-        resp = model.generate_content(prompt)
-        text_resp = resp.text
-        if "```json" in text_resp:
-            clean = text_resp.split("```json")[1].split("```")[0].strip()
-        elif "```" in text_resp:
-            clean = text_resp.split("```")[1].split("```")[0].strip()
-        else:
-            clean = text_resp.strip()
-            
-        data = json.loads(clean)
-        
-        conn = get_db_connection()
-        today_dt = datetime.now()
-        next_review = (today_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-        
-        saved_words = []
-        for item in data:
-            conn.cursor().execute(
-                '''INSERT OR IGNORE INTO vocab (word, language, translation, last_reviewed, next_review_date, proficiency) 
-                   VALUES (?, ?, ?, ?, ?, 0)''', 
-                (item['word'], lang, item['trans'], today_dt.strftime("%Y-%m-%d"), next_review)
-            )
-            saved_words.append(item['word'])
-        conn.commit()
-        conn.close()
-        return saved_words
+        # 尝试列出模型，如果 Key 没权限，会报错进入 except
+        available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        # 优先找 Flash，没有就找 Pro
+        for m in available: 
+            if "flash" in m and "1.5" in m: return m
+        for m in available:
+            if "gemini-pro" in m: return m
+        return "models/gemini-1.5-flash" # 默认备选
     except:
-        return []
+        return "models/gemini-1.5-flash" # 盲猜一个
 
 # ==========================================
-# 3. 侧边栏设置
+# 4. 侧边栏设置
 # ==========================================
 with st.sidebar:
     st.header("⚙️ Settings")
+    
+    # API Key
     api_key = st.secrets.get("GOOGLE_API_KEY") or st.text_input("Google API Key", type="password")
     
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("models/gemini-2.5-flash")
+        # 自动选择模型
+        model_name = get_working_model()
+        model = genai.GenerativeModel(model_name)
     else:
         st.warning("⚠️ Need API Key")
         st.stop()
 
     language = st.selectbox("Target Language", ["German", "Spanish", "English", "French"])
     
-    # 数据库统计
+    # 数据库读取当前等级
     conn = get_db_connection()
     level_row = conn.cursor().execute("SELECT level FROM user_levels WHERE language=?", (language,)).fetchone()
-    current_level = level_row[0] if level_row else "A1"
-    
-    today = datetime.now().strftime("%Y-%m-%d")
-    try:
-        review_count = conn.cursor().execute(
-            "SELECT count(*) FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL)", 
-            (language, today)).fetchone()[0]
-    except:
-        review_count = 0
+    db_level = level_row[0] if level_row else "A1"
     conn.close()
+
+    # === 新增功能：手动选择难度 ===
+    st.divider()
+    st.write("📊 **Difficulty Level**")
+    # 默认选中数据库里的等级，但用户可以手动改
+    selected_level = st.selectbox(
+        "Current Level (You can change this):", 
+        ["A1", "A2", "B1", "B2", "C1", "C2"],
+        index=["A1", "A2", "B1", "B2", "C1", "C2"].index(db_level)
+    )
     
-    st.metric(f"Current Level", current_level)
-    st.metric(f"Due for Review", f"{review_count} words")
-    
+    # 如果用户改了，更新数据库
+    if selected_level != db_level:
+        conn = get_db_connection()
+        conn.cursor().execute("INSERT OR REPLACE INTO user_levels (language, level, last_assessed) VALUES (?, ?, ?)", 
+                              (language, selected_level, datetime.now().strftime("%Y-%m-%d")))
+        conn.commit()
+        conn.close()
+        st.toast(f"Level updated to {selected_level}!")
+
     st.divider()
     
     # === 情景选择器 ===
-    st.subheader("🎭 Choose Scenario")
+    st.subheader("🎭 Scenario")
     scenarios = {
-        "☕ Cafe Ordering": "You are a barista in a busy cafe. You are impatient but polite. The user wants to order coffee.",
-        "🛃 Customs Officer": "You are a strict customs officer at the airport. Ask about the user's visa, duration of stay, and purpose of visit.",
-        "🤝 New Friend": "You are a friendly student at a university party. You want to know about the user's hobbies.",
-        "🛒 Grocery Store": "You are a cashier at a supermarket. Ask if the user has a loyalty card and if they need a bag.",
-        "🤖 Free Chat": "You are a helpful language tutor. Chat about anything."
+        "☕ Cafe": "Barista. Impatient but polite.",
+        "🛃 Customs": "Strict customs officer.",
+        "🤝 Friend": "Friendly student.",
+        "🤖 Free Chat": "Helpful tutor."
     }
+    current_scenario = st.radio("Context:", list(scenarios.keys()))
     
-    selected_scenario = st.radio("Roleplay Context:", list(scenarios.keys()))
-    
-    # 如果切换了场景，清空历史
-    if selected_scenario != st.session_state.current_scenario:
+    # 切换场景清空历史
+    if current_scenario != st.session_state.current_scenario:
         st.session_state.messages = []
-        st.session_state.current_scenario = selected_scenario
+        st.session_state.current_scenario = current_scenario
         st.rerun()
+
+    if st.button("🗑️ Clear Chat"):
+        st.session_state.messages = []
+        st.rerun()
+
+# ==========================================
+# 5. 主界面
+# ==========================================
+st.title(f"🦄 AI Tutor: {language} ({selected_level})")
+
+# 显示历史消息
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# === 核心修改：输入框永远在底部 ===
+# st.chat_input 是 Streamlit 专门设计的底部吸附组件
+if user_input := st.chat_input(f"Say something in {language}..."):
+    
+    # 1. 显示用户输入
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
         
-    if st.button("🗑️ Clear Chat History"):
-        st.session_state.messages = []
-        st.rerun()
-
-# ==========================================
-# 4. 主界面
-# ==========================================
-st.title("🦄 AI Omni-Tutor: Roleplay Mode")
-tab1, tab2, tab3 = st.tabs(["💬 Roleplay Chat", "📸 Photo Learning", "🧠 Flashcards"])
-
-# --- TAB 1: 角色扮演对话 (核心升级) ---
-with tab1:
-    st.caption(f"Scenario: **{selected_scenario}** | Level: **{current_level}**")
-    
-    # 1. 显示历史消息
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-    
-    # 2. 处理用户输入
-    if user_input := st.chat_input(f"Say something in {language}..."):
-        # 显示用户消息
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
-            
-        # 生成 AI 回复
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            full_response = ""
-            
-            # 构造 Prompt：核心魔法
-            system_instruction = f"""
-            Act as a character in this scenario: {scenarios[selected_scenario]}.
+    # 2. AI 生成回复
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        full_response = ""
+        
+        try:
+            # 构造 Prompt
+            prompt = f"""
+            Act as a character in this scenario: {scenarios[current_scenario]}.
             Language: {language}.
-            User Level: {current_level}.
+            User Level: {selected_level}.
             
-            Rules:
-            1. Keep responses concise (1-3 sentences) to keep the conversation flowing.
-            2. If the user makes a grammar mistake, correct it gently inside parentheses at the end. Example: "Ja, das ist gut. (Correction: 'das' should be 'der')"
-            3. Stay in character!
+            Task: Reply to the user.
+            1. Keep it concise (1-3 sentences).
+            2. If user makes a mistake, correct it at the end in (parentheses).
             """
             
-            # 将历史记录转换为 Gemini 格式
-            history_gemini = [{"role": "user", "parts": [system_instruction]}] 
-            for m in st.session_state.messages[:-1]: # 不包含最新的 user_input，因为下面单独发
-                role = "user" if m["role"] == "user" else "model"
-                history_gemini.append({"role": role, "parts": [m["content"]]})
-            history_gemini.append({"role": "user", "parts": [user_input]})
+            # 历史记录上下文
+            history = [{"role": "user", "parts": [prompt]}]
+            for m in st.session_state.messages[:-1]:
+                role = "model" if m["role"] == "assistant" else "user"
+                history.append({"role": role, "parts": [m["content"]]})
+            history.append({"role": "user", "parts": [user_input]})
             
             # 流式生成
-            try:
-                chat = model.start_chat(history=history_gemini[:-1])
-                response = chat.send_message(user_input, stream=True)
-                
-                for chunk in response:
-                    if chunk.text:
-                        full_response += chunk.text
-                        placeholder.markdown(full_response + "▌")
-                placeholder.markdown(full_response)
-                
-                # 保存 AI 消息
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                
-                # --- 语音播放 (只播放最新的一句) ---
-                clean_txt = clean_text_for_tts(full_response)
-                audio_fp = asyncio.run(generate_audio_edge(clean_txt, language))
-                if audio_fp:
-                    st.audio(audio_fp, format='audio/mp3', autoplay=True)
-                
-                # --- 自动提取单词 ---
-                with st.status("🧠 Analyzing vocabulary...", expanded=False):
-                    new_words = extract_and_save_vocab(full_response, language)
-                    if new_words:
-                        st.write(f"Added to review: **{', '.join(new_words)}**")
-                    else:
-                        st.write("No difficult words found.")
-                        
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-# --- TAB 2: 拍照学习 (保持不变) ---
-with tab2:
-    uploaded_file = st.file_uploader("Upload photo", type=["jpg", "png", "jpeg"])
-    if uploaded_file:
-        image = Image.open(uploaded_file)
-        st.image(image, width=300)
-        if st.button("🔍 Analyze"):
-            with st.spinner("👀 Looking..."):
-                try:
-                    prompt = f"Describe in {language} (Level {current_level}) and list 3 words."
-                    response = model.generate_content([prompt, image])
-                    st.markdown(response.text)
-                    audio_fp = asyncio.run(generate_audio_edge(clean_text_for_tts(response.text), language))
-                    if audio_fp: st.audio(audio_fp, format='audio/mp3')
-                    extract_and_save_vocab(response.text, language)
-                except Exception as e: st.error(str(e))
-
-# --- TAB 3: 复习模式 (保持不变) ---
-with tab3:
-    if st.button("🔄 Next Batch"):
-        st.session_state.review_queue = []
-        st.rerun()
-
-    if not st.session_state.review_queue:
-        conn = get_db_connection()
-        today = datetime.now().strftime("%Y-%m-%d")
-        try:
-            rows = conn.cursor().execute(
-                "SELECT word, translation, proficiency FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL) ORDER BY random() LIMIT 10", 
-                (language, today)).fetchall()
-            st.session_state.review_queue = rows
-        except: pass
-        conn.close()
-
-    if st.session_state.review_queue:
-        word, translation, prof = st.session_state.review_queue[0]
-        st.progress(prof/5, text=f"Mastery: {prof}/5")
-        st.markdown(f"## {word}")
-        
-        if st.button("🔊 Pronounce"):
-             audio_fp = asyncio.run(generate_audio_edge(word, language))
-             if audio_fp: st.audio(audio_fp, format='audio/mp3', autoplay=True)
-
-        if st.button("👀 Reveal"): st.session_state.show_answer = True
+            chat = model.start_chat(history=history[:-1])
+            response = chat.send_message(user_input, stream=True)
             
-        if st.session_state.show_answer:
-            st.success(f"**{translation}**")
-            c1, c2, c3 = st.columns(3)
-            def process(res):
-                conn = get_db_connection()
-                today_dt = datetime.now()
-                new_prof = max(0, prof-1) if res == "forget" else (prof if res == "ok" else min(5, prof+1))
-                days = 1 if res == "forget" else (2 if res == "ok" else 3 + new_prof * 2)
-                next_date = (today_dt + timedelta(days=days)).strftime("%Y-%m-%d")
-                conn.cursor().execute("UPDATE vocab SET proficiency=?, last_reviewed=?, next_review_date=? WHERE word=? AND language=?",
-                                      (new_prof, today_dt.strftime("%Y-%m-%d"), next_date, word, language))
-                conn.commit()
-                conn.close()
-                st.session_state.review_queue.pop(0)
-                st.session_state.show_answer = False
-                st.rerun()
-            if c1.button("😭 Forgot"): process("forget")
-            if c2.button("😐 Hard"): process("ok")
-            if c3.button("😎 Easy"): process("easy")
-    else:
-        st.balloons()
-        st.success("No reviews due!")
+            for chunk in response:
+                if chunk.text:
+                    full_response += chunk.text
+                    placeholder.markdown(full_response + "▌")
+            placeholder.markdown(full_response)
+            
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            
+            # === 语音播放 (带错误处理) ===
+            with st.spinner("🔊 Generating audio..."):
+                clean_txt = clean_text_for_tts(full_response)
+                # 这里的 asyncio.run 可能会在某些特定环境报错，如果报错请告诉我
+                try:
+                    audio_fp = asyncio.run(generate_audio_edge(clean_txt, language))
+                    if audio_fp:
+                        st.audio(audio_fp, format='audio/mp3', autoplay=True)
+                    else:
+                        st.warning("⚠️ 语音生成失败 (请检查网络/代理)")
+                except Exception as tts_err:
+                    st.warning(f"⚠️ 语音组件错误: {tts_err}")
+
+        except Exception as e:
+            st.error(f"AI Error: {e}")

@@ -3,3 +3,4 @@ google-generativeai
 pandas
 edge-tts
 Pillow
+nest_asyncio

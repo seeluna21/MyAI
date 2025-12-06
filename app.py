@@ -122,7 +122,7 @@ with st.sidebar:
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("models/gemini-1.5-flash")
+        model = genai.GenerativeModel("models/gemini-2.5-flash")
     else:
         st.warning("⚠️ Need API Key")
         st.stop()

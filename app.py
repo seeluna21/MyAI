@@ -21,8 +21,15 @@ st.set_page_config(page_title="AI Omni-Tutor V8.0 (Firebase Cloud)", page_icon="
 
 # 初始化 Firebase (防止重复初始化报错)
 if not firebase_admin._apps:
-    # 从 Streamlit Secrets 读取配置
-    key_dict = st.secrets["firebase"]
+    # 1. 强制转换为标准字典 (解决 ValueError: Invalid certificate argument)
+    key_dict = dict(st.secrets["firebase"])
+    
+    # 2. 修复私钥格式 (解决 \\n 转义问题)
+    # Streamlit 读取 TOML 时有时会将换行符读取为字符串 "\\n"，需要替换回真正的换行符 "\n"
+    if "private_key" in key_dict:
+        key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
+    
+    # 3. 认证并启动
     cred = credentials.Certificate(key_dict)
     firebase_admin.initialize_app(cred)
 

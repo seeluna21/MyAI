@@ -13,7 +13,7 @@ from gtts import gTTS
 # ==========================================
 # 0. 基础配置
 # ==========================================
-st.set_page_config(page_title="AI Omni-Tutor V7.7 (Translator)", page_icon="🦄", layout="wide")
+st.set_page_config(page_title="AI Omni-Tutor V7.8 (Deep Explain)", page_icon="🦄", layout="wide")
 
 # ==========================================
 # 1. 数据库逻辑
@@ -41,7 +41,7 @@ if "show_answer" not in st.session_state: st.session_state.show_answer = False
 if "current_scenario" not in st.session_state: st.session_state.current_scenario = "Free Chat"
 
 # ==========================================
-# 2. 语音生成工具 (HTML播放器生成器)
+# 2. 语音生成工具 (只读主翻译)
 # ==========================================
 LANG_CODE_MAP = {
     "German": "de", "Spanish": "es", "English": "en", "French": "fr"
@@ -50,8 +50,13 @@ LANG_CODE_MAP = {
 def generate_audio_bytes(text, lang_name):
     """生成音频数据的 BytesIO 对象"""
     try:
-        # ⚠️ 修改：切割符改为 🇺🇸，只读翻译前的目标语言部分
-        speak_text = text.split("🇺🇸")[0].strip() 
+        # ⚠️ 核心逻辑：我们用 '🇺🇸' 作为分割线
+        # 只朗读 '🇺🇸' 之前的内容（即主翻译），忽略后面的解释和例句
+        speak_text = text.split("🇺🇸")[0].strip()
+        
+        # 去除Markdown标题符号（如 ##, **），防止TTS读出符号
+        speak_text = speak_text.replace("#", "").replace("*", "")
+
         if not speak_text: speak_text = text
 
         lang_code = LANG_CODE_MAP.get(lang_name, "en")
@@ -66,9 +71,6 @@ def generate_audio_bytes(text, lang_name):
         return None
 
 def make_audio_html(audio_fp, autoplay=False):
-    """
-    将音频数据转换为 HTML 字符串。
-    """
     if not audio_fp: return ""
     try:
         b64 = base64.b64encode(audio_fp.getvalue()).decode()
@@ -89,9 +91,10 @@ def get_model():
 
 def extract_and_save_vocab(text, lang, model):
     try:
-        # ⚠️ Prompt 修改：明确要求 English Translation
+        # 提取 Prompt：让 AI 从复杂的解释文本中只抓取 3-5 个核心词
         prompt = f"""
-        Analyze this {lang} text. Identify 3-5 key vocabulary words.
+        Analyze this text. Identify 3-5 key vocabulary words specifically for the {lang} language.
+        Ignore the English explanations.
         Output ONLY a raw JSON list. 
         Format: [{{"word": "ForeignWord", "trans": "EnglishTranslation"}}, ...]
         Text: {text}
@@ -178,7 +181,6 @@ with st.sidebar:
     st.metric("Review Due", f"{review_count} words")
     st.divider()
     
-    # ⚠️ 新增 Translator 选项
     scenarios = {
         "🔤 Translator": "Translator",
         "☕ Cafe": "Barista",
@@ -215,10 +217,9 @@ with tab1:
                     st.markdown(msg["audio_html"], unsafe_allow_html=True)
         st.empty() 
 
-    # 动态调整输入框的提示语
     input_placeholder = f"Type in {language}..."
     if scenarios[current_scenario] == "Translator":
-        input_placeholder = "Type any word/sentence to translate..."
+        input_placeholder = "Enter text to translate & explain..."
 
     if user_input := st.chat_input(input_placeholder):
         st.session_state.messages.append({"role": "user", "content": user_input})
@@ -232,22 +233,36 @@ with tab1:
                 full_response = ""
                 
                 try:
-                    # === Prompt 分流逻辑 ===
+                    # === 核心修改：Translator Prompt ===
                     if scenarios[current_scenario] == "Translator":
-                        # 翻译模式 Prompt
                         prompt = f"""
-                        Act as a professional translator. Target Language: {language} ({selected_level}).
+                        Act as an expert language coach. Target Language: {language} ({selected_level}).
                         User Input: "{user_input}"
                         
-                        Task: Translate the user's input (which could be in any language) into natural, native-sounding {language}.
+                        Task:
+                        1. Translate the input into the most natural, native-sounding {language}.
+                        2. Provide the literal English meaning.
+                        3. Explain WHY this expression is natural (nuance, tone).
+                        4. Provide 2-3 alternative expressions (Formal/Casual/Slang).
+                        5. Give a usage example.
+
+                        Output Format (Strictly follow this Markdown structure):
+                        ### [The Translated Text Here]
+                        🇺🇸 Literal: [English Literal Translation]
+
+                        **💡 Analysis:**
+                        [Brief explanation in English about why this is authentic]
+
+                        **🔄 Alternatives:**
+                        * **Formal:** [Expression]
+                        * **Casual:** [Expression]
                         
-                        Structure your reply exactly like this:
-                        1. The translation in {language} (just the text).
-                        2. New line.
-                        3. "🇺🇸 Translation: " followed by the English meaning.
+                        **📝 Example:**
+                        > [Sentence in {language}]
+                        > *([English meaning])*
                         """
                     else:
-                        # 角色扮演/聊天模式 Prompt
+                        # 普通聊天 Prompt
                         prompt = f"""
                         Act as a {scenarios[current_scenario]}. Language: {language} ({selected_level}).
                         User says: "{user_input}".
@@ -269,6 +284,7 @@ with tab1:
                     placeholder.markdown(full_response)
                     
                     # === 音频处理 ===
+                    # 依然使用 🇺🇸 作为切割点，只读第一部分（主翻译）
                     audio_bytes = generate_audio_bytes(full_response, language)
                     audio_html_autoplay = make_audio_html(audio_bytes, autoplay=True)
                     audio_html_store = make_audio_html(audio_bytes, autoplay=False)
@@ -282,7 +298,6 @@ with tab1:
                         "audio_html": audio_html_store
                     })
 
-                    # 存词
                     new_words = extract_and_save_vocab(full_response, language, model)
                     if new_words:
                         st.toast(f"💾 Saved: {', '.join(new_words)}", icon="🧠")
@@ -300,7 +315,6 @@ with tab2:
         if st.button("🔍 Analyze Photo"):
             with st.spinner("🤖 Analyzing..."):
                 try:
-                    # 📸 拍照 Prompt 也改成英文翻译
                     prompt = f"""
                     Describe this image in {language} (Level {selected_level}).
                     Then provide an English translation starting with "🇺🇸 Translation:".

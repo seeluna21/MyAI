@@ -4,16 +4,16 @@ import sqlite3
 import json
 import os
 import re
-import uuid
+import base64  # 新增：用于HTML音频播放
 from datetime import datetime, timedelta
 from io import BytesIO
 from PIL import Image
-from gtts import gTTS  # 核心：换成 Google 的 TTS 库
+from gtts import gTTS
 
 # ==========================================
 # 0. 基础配置
 # ==========================================
-st.set_page_config(page_title="AI Omni-Tutor V7.3 (Google Edition)", page_icon="🦄", layout="wide")
+st.set_page_config(page_title="AI Omni-Tutor V7.5 (Universal)", page_icon="🦄", layout="wide")
 
 # ==========================================
 # 1. 数据库逻辑
@@ -40,54 +40,55 @@ if "show_answer" not in st.session_state: st.session_state.show_answer = False
 if "current_scenario" not in st.session_state: st.session_state.current_scenario = "Free Chat"
 
 # ==========================================
-# 2. 语音生成 (切换为 Google gTTS)
+# 2. 语音生成 (万能兼容版)
 # ==========================================
-# gTTS 使用的是简写的语言代码，我们需要映射一下
 LANG_CODE_MAP = {
-    "German": "de",
-    "Spanish": "es",
-    "English": "en",
-    "French": "fr"
+    "German": "de", "Spanish": "es", "English": "en", "French": "fr"
 }
 
-def generate_audio_stream(text, lang_name):
-    """
-    使用 gTTS (Google Translate TTS) 生成语音。
-    优点：不需要 asyncio，不需要 key，连接稳定。
-    """
+def generate_audio_bytes(text, lang_name):
+    """生成音频数据的 BytesIO 对象"""
     try:
-        # 1. 获取对应的简写代码 (如 German -> de)
         lang_code = LANG_CODE_MAP.get(lang_name, "en")
+        if not text.strip(): return None
         
-        # 2. 如果是空文本，直接返回
-        if not text.strip():
-            return None
-            
-        # 3. 调用 Google 接口
         tts = gTTS(text=text, lang=lang_code, slow=False)
-        
-        # 4. 写入内存
         mp3_fp = BytesIO()
         tts.write_to_fp(mp3_fp)
         mp3_fp.seek(0)
-        
         return mp3_fp
-        
     except Exception as e:
         return f"TTS Error: {str(e)}"
+
+def play_audio_html(audio_fp):
+    """
+    【核心修复】使用 HTML 标签播放音频。
+    这种方法不依赖 Streamlit 版本，彻底解决 unexpected keyword argument 'key' 报错。
+    """
+    try:
+        # 将音频转换为 base64 字符串
+        b64 = base64.b64encode(audio_fp.getvalue()).decode()
+        # 构建 HTML 播放器，设置 autoplay
+        md = f"""
+            <audio controls autoplay style="width: 100%;">
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            </audio>
+        """
+        # 使用 unsafe_allow_html 渲染
+        st.markdown(md, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Audio Playback Error: {e}")
 
 # ==========================================
 # 3. 工具函数
 # ==========================================
 def clean_text_for_tts(text):
-    # 去除括号内容、Markdown符号
     text = re.sub(r'\(.*?\)', '', text)
     text = text.replace('**', '').replace('*', '').replace('`', '').replace('#', '')
     return text.strip()
 
 def get_model():
-    # 这里设置你想要的模型
-    # 注意：目前没有 2.5-flash，只有 1.5-flash 或 2.0-flash-exp
+    # 保持使用 1.5-flash，它是目前最稳定的版本
     return "models/gemini-2.5-flash" 
 
 def extract_and_save_vocab(text, lang, model):
@@ -139,13 +140,9 @@ with st.sidebar:
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
         genai.configure(api_key=api_key)
-        
-        # 尝试加载模型
         try:
             model_name = get_model()
             model = genai.GenerativeModel(model_name)
-            # 简单的测试调用，确保模型可用
-            # model.generate_content("test") 
             st.caption(f"🚀 Running on: {model_name}")
         except Exception as e:
             st.error(f"Model Error: {e}")
@@ -160,7 +157,6 @@ with st.sidebar:
     level_row = conn.cursor().execute("SELECT level FROM user_levels WHERE language=?", (language,)).fetchone()
     db_level = level_row[0] if level_row else "A1"
     
-    # 获取复习数量
     today = datetime.now().strftime("%Y-%m-%d")
     try:
         review_count = conn.cursor().execute(
@@ -224,7 +220,6 @@ with tab1:
                 full_response = ""
                 
                 try:
-                    # 构建 Prompt
                     prompt = f"""
                     Act as a {scenarios[current_scenario]}. Language: {language} ({selected_level}).
                     User says: "{user_input}".
@@ -242,18 +237,16 @@ with tab1:
                     
                     st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-                    # === 语音生成 (gTTS) ===
+                    # === 语音生成 (HTML版) ===
                     clean_txt = clean_text_for_tts(full_response)
-                    # gTTS 是同步的，直接调用即可
-                    audio_data = generate_audio_stream(clean_txt, language)
+                    audio_data = generate_audio_bytes(clean_txt, language)
                     
                     if isinstance(audio_data, str):
                         st.error(audio_data)
                     elif audio_data:
-                        # 依然使用 key 来强制刷新播放器
-                        st.audio(audio_data, format='audio/mp3', autoplay=True, key=f"tts_{uuid.uuid4()}")
+                        # 使用自定义函数播放，不再调用 st.audio
+                        play_audio_html(audio_data)
 
-                    # 存词
                     new_words = extract_and_save_vocab(full_response, language, model)
                     if new_words:
                         st.toast(f"💾 Saved: {', '.join(new_words)}", icon="🧠")
@@ -276,9 +269,9 @@ with tab2:
                     st.markdown(response.text)
                     
                     clean_txt = clean_text_for_tts(response.text)
-                    audio_data = generate_audio_stream(clean_txt, language)
+                    audio_data = generate_audio_bytes(clean_txt, language)
                     if isinstance(audio_data, BytesIO):
-                        st.audio(audio_data, format='audio/mp3', key=f"photo_{uuid.uuid4()}")
+                         play_audio_html(audio_data)
                     
                     extract_and_save_vocab(response.text, language, model)
                 except Exception as e:
@@ -317,9 +310,9 @@ with tab3:
         c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
             if st.button("🔊 Pronounce", key=f"btn_{word}"):
-                res = generate_audio_stream(word, language)
+                res = generate_audio_bytes(word, language)
                 if isinstance(res, BytesIO): 
-                    st.audio(res, format='audio/mp3', autoplay=True, key=f"rev_{word}_{uuid.uuid4()}")
+                     play_audio_html(res)
 
         with c2:
             if st.button("👀 Reveal"):

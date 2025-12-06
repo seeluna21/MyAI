@@ -4,3 +4,4 @@ pandas
 edge-tts
 Pillow
 nest_asyncio
+gTTS

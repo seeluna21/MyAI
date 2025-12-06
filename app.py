@@ -86,7 +86,7 @@ def clean_text_for_tts(text):
 
 def get_working_model():
     # 简化的模型选择逻辑
-    return "models/gemini-1.5-flash"
+    return "models/gemini-2.5-flash"
 
 def extract_and_save_vocab(text, lang, model):
     try:
@@ -137,7 +137,7 @@ with st.sidebar:
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("models/gemini-1.5-flash")
+        model = genai.GenerativeModel("models/gemini-2.5-flash")
     else:
         st.warning("Please setup API Key")
         st.stop()

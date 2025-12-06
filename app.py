@@ -17,8 +17,8 @@ from PIL import Image
 st.set_page_config(page_title="AI Omni-Tutor", page_icon="🦄", layout="wide")
 
 def get_db_connection():
+    # 建议使用绝对路径或者确保当前目录可写
     conn = sqlite3.connect("web_language_brain_v3.db")
-    # conn = sqlite3.connect("web_language_brain.db")
     return conn
 
 def init_db():
@@ -46,36 +46,38 @@ if "show_answer" not in st.session_state: st.session_state.show_answer = False
 # ==========================================
 
 # 2.1 微软 Edge TTS (超逼真语音)
-# 语音角色映射表
 VOICE_MAP = {
-    "German": "de-DE-KatjaNeural",    # 德国-卡佳 (女，超自然)
-    "Spanish": "es-ES-AlvaroNeural",  # 西班牙-阿尔瓦罗 (男)
-    "English": "en-US-AriaNeural",    # 美国-Aria
-    "French": "fr-FR-DeniseNeural"    # 法国-丹尼斯
+    "German": "de-DE-KatjaNeural",    
+    "Spanish": "es-ES-AlvaroNeural",  
+    "English": "en-US-AriaNeural",    
+    "French": "fr-FR-DeniseNeural"    
 }
 
 async def generate_audio_edge(text, lang):
-    """使用 Edge TTS 生成语音流"""
-    voice = VOICE_MAP.get(lang, "en-US-AriaNeural")
-    communicate = edge_tts.Communicate(text, voice)
-    
-    # 写入内存流
-    mp3_fp = BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            mp3_fp.write(chunk["data"])
-    mp3_fp.seek(0)
-    return mp3_fp
+    """使用 Edge TTS 生成语音流 (带错误捕获)"""
+    try:
+        voice = VOICE_MAP.get(lang, "en-US-AriaNeural")
+        communicate = edge_tts.Communicate(text, voice)
+        
+        mp3_fp = BytesIO()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                mp3_fp.write(chunk["data"])
+        mp3_fp.seek(0)
+        return mp3_fp
+    except Exception as e:
+        print(f"TTS Error: {e}")
+        return None
 
 # 2.2 文本清洗
 def clean_text_for_tts(text):
+    # 去除 Markdown 和特殊符号
     text = text.replace('**', '').replace('*', '').replace('##', '').replace('#', '').replace('`', '')
     text = re.sub(r'^\s*-\s+', '', text, flags=re.MULTILINE)
     return text.strip()
 
 # 2.3 智能模型选择
 def get_best_model():
-    # 简单粗暴：直接用 Flash，它现在支持 Vision 且速度快
     return "models/gemini-2.5-flash"
 
 # ==========================================
@@ -90,7 +92,11 @@ with st.sidebar:
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(get_best_model())
+        try:
+            model = genai.GenerativeModel(get_best_model())
+        except Exception as e:
+            st.error(f"模型加载失败，请检查API Key或网络: {e}")
+            st.stop()
     else:
         st.warning("⚠️ Need API Key")
         st.stop()
@@ -102,11 +108,14 @@ with st.sidebar:
     level_row = conn.cursor().execute("SELECT level FROM user_levels WHERE language=?", (language,)).fetchone()
     current_level = level_row[0] if level_row else "A1"
     
-    # 获取待复习单词数 (今天之前的)
+    # 获取待复习单词数
     today = datetime.now().strftime("%Y-%m-%d")
-    review_count = conn.cursor().execute(
-        "SELECT count(*) FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL)", 
-        (language, today)).fetchone()[0]
+    try:
+        review_count = conn.cursor().execute(
+            "SELECT count(*) FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL)", 
+            (language, today)).fetchone()[0]
+    except:
+        review_count = 0
     conn.close()
     
     st.metric(f"Current Level", current_level)
@@ -125,13 +134,22 @@ def extract_and_save_vocab(text, lang):
     """
     try:
         resp = model.generate_content(prompt)
-        clean = resp.text.replace('```json', '').replace('```', '').strip()
+        # 增强 JSON 清洗逻辑
+        text_resp = resp.text
+        if "```json" in text_resp:
+            clean = text_resp.split("```json")[1].split("```")[0].strip()
+        elif "```" in text_resp:
+            clean = text_resp.split("```")[1].split("```")[0].strip()
+        else:
+            clean = text_resp.strip()
+            
         data = json.loads(clean)
         
         conn = get_db_connection()
         today_dt = datetime.now()
         next_review = (today_dt + timedelta(days=1)).strftime("%Y-%m-%d") # 默认明天复习
         
+        saved_words = []
         for item in data:
             # 插入或忽略
             conn.cursor().execute(
@@ -139,10 +157,12 @@ def extract_and_save_vocab(text, lang):
                    VALUES (?, ?, ?, ?, ?, 0)''', 
                 (item['word'], lang, item['trans'], today_dt.strftime("%Y-%m-%d"), next_review)
             )
+            saved_words.append(item['word'])
         conn.commit()
         conn.close()
-        return [d['word'] for d in data]
-    except:
+        return saved_words
+    except Exception as e:
+        print(f"Vocab Extract Error: {e}")
         return []
 
 # 4.2 更新等级
@@ -178,29 +198,41 @@ with tab1:
             full_text = ""
             
             # 生成文本
-            prompt = f"Write a lesson about '{topic}' in {language} (Level {current_level}). Include English translation at bottom."
-            stream = model.generate_content(prompt, stream=True)
-            
-            for chunk in stream:
-                if chunk.text:
-                    full_text += chunk.text
-                    placeholder.markdown(full_text + "▌")
-            placeholder.markdown(full_text)
-            
-            # 生成语音 (Edge TTS) & 提取单词
-            if full_text:
-                col_a, col_b = st.columns([1, 1])
-                with col_a:
-                    with st.spinner("🔊 Synthesizing natural speech..."):
-                        clean_txt = clean_text_for_tts(full_text)
-                        # 运行异步 TTS
-                        audio_fp = asyncio.run(generate_audio_edge(clean_txt, language))
-                        st.audio(audio_fp, format='audio/mp3')
+            try:
+                prompt = f"Write a lesson about '{topic}' in {language} (Level {current_level}). Include English translation at bottom."
+                stream = model.generate_content(prompt, stream=True)
                 
-                with col_b:
-                    with st.status("📥 Saving vocabulary...", expanded=False) as status:
-                        new_words = extract_and_save_vocab(full_text, language)
-                        status.update(label=f"Saved: {', '.join(new_words)}", state="complete")
+                for chunk in stream:
+                    if chunk.text:
+                        full_text += chunk.text
+                        placeholder.markdown(full_text + "▌")
+                placeholder.markdown(full_text)
+                
+                # 生成语音 (Edge TTS) & 提取单词
+                if full_text:
+                    col_a, col_b = st.columns([1, 1])
+                    with col_a:
+                        with st.spinner("🔊 Synthesizing natural speech..."):
+                            clean_txt = clean_text_for_tts(full_text)
+                            # 运行异步 TTS
+                            try:
+                                audio_fp = asyncio.run(generate_audio_edge(clean_txt, language))
+                                if audio_fp:
+                                    st.audio(audio_fp, format='audio/mp3')
+                                else:
+                                    st.warning("⚠️ TTS Failed (Check Network)")
+                            except Exception as e:
+                                st.error(f"TTS Error: {e}")
+                    
+                    with col_b:
+                        with st.status("📥 Saving vocabulary...", expanded=False) as status:
+                            new_words = extract_and_save_vocab(full_text, language)
+                            if new_words:
+                                status.update(label=f"Saved: {', '.join(new_words)}", state="complete")
+                            else:
+                                status.update(label="No new words found", state="complete")
+            except Exception as e:
+                st.error(f"AI Generation Error: {e}")
 
             # 难度反馈
             st.write("---")
@@ -220,35 +252,47 @@ with tab2:
         
         if st.button("🔍 Analyze & Teach Me"):
             with st.spinner("🤖 Vision AI is looking at your photo..."):
-                prompt = f"""
-                Look at this image. 
-                1. Describe what you see in {language} (Level {current_level}).
-                2. List 5 key vocabulary words from the image with English translations.
-                """
-                # Gemini 接收 [文本, 图片]
-                response = model.generate_content([prompt, image])
-                st.markdown(response.text)
-                
-                # 自动生成语音
-                clean_txt = clean_text_for_tts(response.text)
-                audio_fp = asyncio.run(generate_audio_edge(clean_txt, language))
-                st.audio(audio_fp, format='audio/mp3')
-                
-                # 存词
-                extract_and_save_vocab(response.text, language)
+                try:
+                    prompt = f"""
+                    Look at this image. 
+                    1. Describe what you see in {language} (Level {current_level}).
+                    2. List 5 key vocabulary words from the image with English translations.
+                    """
+                    # Gemini 接收 [文本, 图片]
+                    response = model.generate_content([prompt, image])
+                    st.markdown(response.text)
+                    
+                    # 自动生成语音
+                    clean_txt = clean_text_for_tts(response.text)
+                    audio_fp = asyncio.run(generate_audio_edge(clean_txt, language))
+                    if audio_fp:
+                        st.audio(audio_fp, format='audio/mp3')
+                    
+                    # 存词
+                    extract_and_save_vocab(response.text, language)
+                except Exception as e:
+                    st.error(f"Vision Error: {e}")
 
 # --- TAB 3: 复习模式 (Review) ---
 with tab3:
     st.subheader("🧠 Spaced Repetition Review")
     
+    # 手动刷新按钮
+    if st.button("🔄 Refresh Queue"):
+        st.session_state.review_queue = []
+        st.rerun()
+
     # 如果队列为空，从数据库加载
     if not st.session_state.review_queue:
         conn = get_db_connection()
         today = datetime.now().strftime("%Y-%m-%d")
         # 选取复习时间到了的词，或者 proficiency 低的词
-        rows = conn.cursor().execute(
-            "SELECT word, translation, proficiency FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL) ORDER BY random() LIMIT 10", 
-            (language, today)).fetchall()
+        try:
+            rows = conn.cursor().execute(
+                "SELECT word, translation, proficiency FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL) ORDER BY random() LIMIT 10", 
+                (language, today)).fetchall()
+        except:
+            rows = []
         conn.close()
         st.session_state.review_queue = rows
     
@@ -258,7 +302,7 @@ with tab3:
         word, translation, prof = st.session_state.review_queue[0]
         
         # 卡片 UI
-        st.info(f"🔥 Proficiency: {prof}/5")
+        st.progress(prof/5, text=f"Proficiency: {prof}/5")
         st.markdown(f"# {word}")
         
         # 翻转卡片
@@ -270,19 +314,20 @@ with tab3:
             
             c1, c2, c3 = st.columns(3)
             
-            def handle_review(result):
+            # 定义处理函数
+            def process_review(result):
                 conn = get_db_connection()
                 today_dt = datetime.now()
                 
                 if result == "forget":
                     new_prof = max(0, prof - 1)
-                    days = 1 # 忘了就明天再复习
+                    days = 1
                 elif result == "ok":
-                    new_prof = prof # 保持
+                    new_prof = prof 
                     days = 2
                 elif result == "easy":
                     new_prof = min(5, prof + 1)
-                    days = 3 + new_prof * 2 # 越熟练，间隔越久
+                    days = 3 + new_prof * 2 
                 
                 next_date = (today_dt + timedelta(days=days)).strftime("%Y-%m-%d")
                 
@@ -296,17 +341,22 @@ with tab3:
                 # 移除当前词，进入下一个
                 st.session_state.review_queue.pop(0)
                 st.session_state.show_answer = False
+                
+            # 使用 callback 处理点击
+            if c1.button("😭 Forgot"): 
+                process_review("forget")
                 st.rerun()
-
-            if c1.button("😭 Forgot"): handle_review("forget")
-            if c2.button("😐 Hard"): handle_review("ok")
-            if c3.button("😎 Easy"): handle_review("easy")
+            if c2.button("😐 Hard"): 
+                process_review("ok")
+                st.rerun()
+            if c3.button("😎 Easy"): 
+                process_review("easy")
+                st.rerun()
             
     else:
         st.balloons()
         st.success("🎉 All caught up! No words to review for today.")
         if st.button("Load Random Words (Extra Practice)"):
-             # 强制加载随机词用于练习
             conn = get_db_connection()
             rows = conn.cursor().execute(
                 "SELECT word, translation, proficiency FROM vocab WHERE language=? ORDER BY random() LIMIT 5", 

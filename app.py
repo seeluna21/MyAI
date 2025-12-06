@@ -77,7 +77,7 @@ def extract_and_save_vocab(text, lang):
     try:
         # 使用简单的正则或 prompt 提取，这里为了速度不阻塞对话，建议只提取关键词
         # 实际生产中可以异步调用，这里为了演示保留同步但放在 status 框里
-        model = genai.GenerativeModel("models/gemini-1.5-flash")
+        model = genai.GenerativeModel("models/gemini-2.5-flash")
         prompt = f"""
         Extract 3 difficult vocabulary words from this {lang} text.
         Output JSON ONLY: [{{"word": "word1", "trans": "english_meaning"}}]

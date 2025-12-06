@@ -6,24 +6,23 @@ import os
 import re
 import asyncio
 import edge_tts
-import nest_asyncio  # 核心救星库
+import nest_asyncio
+import uuid  # 新增：用于生成唯一key
 from datetime import datetime, timedelta
 from io import BytesIO
 from PIL import Image
 
 # ==========================================
-# 0. 核心补丁 (解决 Streamlit Event Loop 报错)
+# 0. 核心配置与补丁
 # ==========================================
 nest_asyncio.apply()
-
-st.set_page_config(page_title="AI Omni-Tutor V7.1", page_icon="🦄", layout="wide")
+st.set_page_config(page_title="AI Omni-Tutor V7.2", page_icon="🦄", layout="wide")
 
 # ==========================================
-# 1. 数据库
+# 1. 数据库逻辑
 # ==========================================
 def get_db_connection():
-    # 使用 v6.db 确保数据库结构最新
-    return sqlite3.connect("web_language_brain_v6.db")
+    return sqlite3.connect("web_language_brain_v6.db", check_same_thread=False) # 增加 check_same_thread
 
 def init_db():
     conn = get_db_connection()
@@ -38,13 +37,14 @@ def init_db():
 
 init_db()
 
+# 初始化 Session State
 if "messages" not in st.session_state: st.session_state.messages = []
 if "review_queue" not in st.session_state: st.session_state.review_queue = []
 if "show_answer" not in st.session_state: st.session_state.show_answer = False
 if "current_scenario" not in st.session_state: st.session_state.current_scenario = "Free Chat"
 
 # ==========================================
-# 2. 语音生成 (增强稳定性版)
+# 2. 语音生成 (修复版：解决无声问题)
 # ==========================================
 VOICE_MAP = {
     "German": "de-DE-KatjaNeural",
@@ -53,8 +53,8 @@ VOICE_MAP = {
     "French": "fr-FR-DeniseNeural"
 }
 
-# 纯异步生成函数
 async def _gen_audio(text, voice):
+    """异步生成音频数据的核心逻辑"""
     communicate = edge_tts.Communicate(text, voice)
     mp3_fp = BytesIO()
     async for chunk in communicate.stream():
@@ -63,42 +63,30 @@ async def _gen_audio(text, voice):
     mp3_fp.seek(0)
     return mp3_fp
 
-# 同步包装器
 def generate_audio_stream(text, lang):
+    """
+    同步包装器：直接使用 asyncio.run()，因为 nest_asyncio 已经打过补丁。
+    这比手动管理 event_loop 更稳定。
+    """
     try:
         voice = VOICE_MAP.get(lang, "en-US-AriaNeural")
-        
-        # 获取或创建事件循环
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-        # 使用 nest_asyncio 允许的方式运行
-        return loop.run_until_complete(_gen_audio(text, voice))
-            
+        # 直接运行异步函数
+        return asyncio.run(_gen_audio(text, voice))
     except Exception as e:
         return f"ERROR_DETAILS: {str(e)}"
 
 # ==========================================
-# 3. 其他工具函数 (文本清洗、模型选择、单词提取)
+# 3. 工具函数
 # ==========================================
 def clean_text_for_tts(text):
+    # 去除括号内容、Markdown符号，防止TTS读出奇怪的符号
     text = re.sub(r'\(.*?\)', '', text)
-    text = text.replace('**', '').replace('*', '').replace('`', '')
+    text = text.replace('**', '').replace('*', '').replace('`', '').replace('#', '')
     return text.strip()
 
 def get_working_model():
-    try:
-        available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for m in available: 
-            if "flash" in m and "1.5" in m: return m
-        for m in available:
-            if "gemini-pro" in m: return m
-        return "models/gemini-1.5-flash"
-    except:
-        return "models/gemini-1.5-flash"
+    # 简化的模型选择逻辑
+    return "models/gemini-1.5-flash"
 
 def extract_and_save_vocab(text, lang, model):
     try:
@@ -109,6 +97,7 @@ def extract_and_save_vocab(text, lang, model):
         """
         resp = model.generate_content(prompt)
         text_resp = resp.text
+        # 清洗 JSON 格式
         if "```json" in text_resp:
             clean = text_resp.split("```json")[1].split("```")[0].strip()
         elif "```" in text_resp:
@@ -136,7 +125,7 @@ def extract_and_save_vocab(text, lang, model):
         return []
 
 # ==========================================
-# 4. 侧边栏
+# 4. 侧边栏设置
 # ==========================================
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -148,12 +137,7 @@ with st.sidebar:
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
         genai.configure(api_key=api_key)
-        try:
-            model_name = get_working_model()
-            model = genai.GenerativeModel(model_name)
-        except:
-            st.error("Invalid API Key")
-            st.stop()
+        model = genai.GenerativeModel("models/gemini-1.5-flash")
     else:
         st.warning("Please setup API Key")
         st.stop()
@@ -164,7 +148,6 @@ with st.sidebar:
     level_row = conn.cursor().execute("SELECT level FROM user_levels WHERE language=?", (language,)).fetchone()
     db_level = level_row[0] if level_row else "A1"
     
-    # 获取复习数量
     today = datetime.now().strftime("%Y-%m-%d")
     try:
         review_count = conn.cursor().execute(
@@ -175,13 +158,8 @@ with st.sidebar:
     conn.close()
 
     st.divider()
-    
     st.write("📊 **Level Override**")
-    selected_level = st.selectbox(
-        "Adjust Difficulty:", 
-        ["A1", "A2", "B1", "B2", "C1", "C2"],
-        index=["A1", "A2", "B1", "B2", "C1", "C2"].index(db_level)
-    )
+    selected_level = st.selectbox("Adjust Difficulty:", ["A1", "A2", "B1", "B2", "C1", "C2"], index=["A1", "A2", "B1", "B2", "C1", "C2"].index(db_level))
     
     if selected_level != db_level:
         conn = get_db_connection()
@@ -193,14 +171,8 @@ with st.sidebar:
     st.metric("Review Due", f"{review_count} words")
     st.divider()
     
-    st.subheader("🎭 Context")
-    scenarios = {
-        "☕ Cafe": "Barista.",
-        "🛃 Customs": "Customs officer.",
-        "🤝 Friend": "Friendly student.",
-        "🤖 Free Chat": "Tutor."
-    }
-    current_scenario = st.radio("Choose:", list(scenarios.keys()))
+    scenarios = {"☕ Cafe": "Barista", "🛃 Customs": "Officer", "🤝 Friend": "Student", "🤖 Free Chat": "Tutor"}
+    current_scenario = st.radio("Context:", list(scenarios.keys()))
     
     if current_scenario != st.session_state.current_scenario:
         st.session_state.messages = []
@@ -212,64 +184,75 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# 5. 主界面 (Tab 布局回归)
+# 5. 主界面
 # ==========================================
 st.title(f"🦄 AI Tutor: {language} ({selected_level})")
 tab1, tab2, tab3 = st.tabs(["💬 Chat & Learn", "📸 Photo Learning", "🧠 Review"])
 
-# --- TAB 1: 聊天 ---
+# --- TAB 1: 聊天 (修复布局和声音) ---
 with tab1:
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    # 1. 创建一个容器来包裹消息，确保布局整洁
+    chat_container = st.container()
+    
+    with chat_container:
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        
+        # 添加一个不可见的元素，确保最后一条消息不被输入框遮挡
+        st.empty()
 
+    # 2. 输入框 (st.chat_input 自动固定在底部)
     if user_input := st.chat_input(f"Type in {language}..."):
+        # 立即显示用户消息
         st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
-            
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            full_response = ""
-            
-            try:
-                prompt = f"""
-                Roleplay: {scenarios[current_scenario]}. Lang: {language}. Level: {selected_level}.
-                Reply to user (1-3 sentences). Correct mistakes at end in (parentheses).
-                """
-                history = [{"role": "user", "parts": [prompt]}]
-                for m in st.session_state.messages[:-1]:
-                    role = "model" if m["role"] == "assistant" else "user"
-                    history.append({"role": role, "parts": [m["content"]]})
-                history.append({"role": "user", "parts": [user_input]})
-                
-                chat = model.start_chat(history=history[:-1])
-                response = chat.send_message(user_input, stream=True)
-                
-                for chunk in response:
-                    if chunk.text:
-                        full_response += chunk.text
-                        placeholder.markdown(full_response + "▌")
-                placeholder.markdown(full_response)
-                
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                
-                # 音频处理
-                with st.spinner("🔊 Generating audio..."):
-                    clean_txt = clean_text_for_tts(full_response)
-                    result = generate_audio_stream(clean_txt, language)
-                    if isinstance(result, str) and result.startswith("ERROR"):
-                        st.error(f"⚠️ 语音失败: {result}")
-                    elif result:
-                        st.audio(result, format='audio/mp3', autoplay=True)
-                
-                # 自动存词
-                with st.status("🧠 Analyzing vocabulary...", expanded=False):
-                    new_words = extract_and_save_vocab(full_response, language, model)
-                    if new_words: st.write(f"Saved: {', '.join(new_words)}")
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(user_input)
 
-            except Exception as e:
-                st.error(f"AI Error: {e}")
+        # 生成 AI 回复
+        with chat_container:
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                full_response = ""
+                
+                try:
+                    prompt = f"""
+                    Act as a {scenarios[current_scenario]}. Language: {language} ({selected_level}).
+                    User says: "{user_input}".
+                    Reply naturally (2-3 sentences). 
+                    Then, if the user made grammar mistakes, list them briefly at the very end inside (parentheses).
+                    """
+                    
+                    # 为了简化，这里不带历史记录，或者你可以按需带上
+                    response = model.generate_content(prompt, stream=True)
+                    
+                    for chunk in response:
+                        if chunk.text:
+                            full_response += chunk.text
+                            placeholder.markdown(full_response + "▌")
+                    placeholder.markdown(full_response)
+                    
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+                    # === 声音修复核心 ===
+                    clean_txt = clean_text_for_tts(full_response)
+                    audio_data = generate_audio_stream(clean_txt, language)
+                    
+                    if isinstance(audio_data, str) and audio_data.startswith("ERROR"):
+                        st.error(f"TTS Error: {audio_data}")
+                    elif audio_data:
+                        # 关键修改：使用 uuid 生成唯一的 key，强制浏览器重新渲染播放器并自动播放
+                        unique_key = f"audio_{uuid.uuid4()}" 
+                        st.audio(audio_data, format='audio/mp3', autoplay=True, key=unique_key)
+
+                    # 自动存词
+                    new_words = extract_and_save_vocab(full_response, language, model)
+                    if new_words:
+                        st.toast(f"💾 Saved: {', '.join(new_words)}", icon="🧠")
+
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 # --- TAB 2: 拍照 ---
 with tab2:
@@ -278,16 +261,17 @@ with tab2:
         image = Image.open(uploaded_file)
         st.image(image, width=300)
         
-        if st.button("🔍 Analyze"):
+        if st.button("🔍 Analyze Photo"):
             with st.spinner("🤖 Analyzing..."):
                 try:
-                    prompt = f"Describe in {language} (Level {selected_level}) and list 3 words."
+                    prompt = f"Describe this image in {language} (Level {selected_level}) and list 3 key vocabulary words."
                     response = model.generate_content([prompt, image])
                     st.markdown(response.text)
                     
                     clean_txt = clean_text_for_tts(response.text)
-                    result = generate_audio_stream(clean_txt, language)
-                    if isinstance(result, BytesIO): st.audio(result, format='audio/mp3')
+                    audio_data = generate_audio_stream(clean_txt, language)
+                    if isinstance(audio_data, BytesIO):
+                        st.audio(audio_data, format='audio/mp3', key="photo_audio")
                     
                     extract_and_save_vocab(response.text, language, model)
                 except Exception as e:
@@ -295,14 +279,19 @@ with tab2:
 
 # --- TAB 3: 复习 ---
 with tab3:
-    if st.button("🔄 Refresh Queue"):
-        st.session_state.review_queue = []
-        st.rerun()
+    col_a, col_b = st.columns([4, 1])
+    with col_a:
+        st.subheader("Flashcards")
+    with col_b:
+        if st.button("🔄 Reload"):
+            st.session_state.review_queue = []
+            st.rerun()
 
     if not st.session_state.review_queue:
         conn = get_db_connection()
         today_str = datetime.now().strftime("%Y-%m-%d")
         try:
+            # 优先复习到期的，随机取10个
             rows = conn.cursor().execute(
                 "SELECT word, translation, proficiency FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL) ORDER BY random() LIMIT 10", 
                 (language, today_str)).fetchall()
@@ -312,25 +301,39 @@ with tab3:
     
     if st.session_state.review_queue:
         word, translation, prof = st.session_state.review_queue[0]
-        st.progress(prof/5, text=f"Proficiency: {prof}/5")
-        st.markdown(f"# {word}")
         
-        if st.button("🔊 Play"):
-            result = generate_audio_stream(word, language)
-            if isinstance(result, BytesIO): st.audio(result, format='audio/mp3', autoplay=True)
+        # 卡片样式
+        st.markdown(f"""
+        <div style="padding: 20px; border-radius: 10px; background-color: #f0f2f6; text-align: center; margin-bottom: 20px;">
+            <h1 style="color: #333; margin:0;">{word}</h1>
+            <p style="color: #666;">Proficiency: {'⭐' * prof}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("🔊 Pronounce", key=f"btn_audio_{word}"):
+                res = generate_audio_stream(word, language)
+                if isinstance(res, BytesIO): 
+                    st.audio(res, format='audio/mp3', autoplay=True, key=f"audio_{word}")
 
-        if st.button("👀 Show Meaning"):
-            st.session_state.show_answer = True
-            
+        with c2:
+            if st.button("👀 Reveal"):
+                st.session_state.show_answer = True
+        
         if st.session_state.show_answer:
-            st.success(f"**Meaning:** {translation}")
-            c1, c2, c3 = st.columns(3)
-            def handle_review(res):
+            st.info(f"**Meaning:** {translation}")
+            
+            st.write("How hard was this?")
+            b1, b2, b3 = st.columns(3)
+            
+            def update_word(quality):
                 conn = get_db_connection()
                 today_dt = datetime.now()
-                if res == "forget": new_prof, days = max(0, prof - 1), 1 
-                elif res == "ok": new_prof, days = prof, 2
-                elif res == "easy": new_prof, days = min(5, prof + 1), 3 + prof * 2
+                # 简单的间隔重复算法 (SM-2 简化版)
+                if quality == 0: new_prof, days = max(0, prof - 1), 0  # Forgot: Review today/tomorrow
+                elif quality == 1: new_prof, days = prof, 2            # Hard
+                else: new_prof, days = min(5, prof + 1), 3 + prof * 2  # Easy
                 
                 next_date = (today_dt + timedelta(days=days)).strftime("%Y-%m-%d")
                 conn.cursor().execute(
@@ -343,8 +346,8 @@ with tab3:
                 st.session_state.show_answer = False
                 st.rerun()
 
-            if c1.button("😭 Forgot"): handle_review("forget")
-            if c2.button("😐 Hard"): handle_review("ok")
-            if c3.button("😎 Easy"): handle_review("easy")
+            if b1.button("😭 Forgot", use_container_width=True): update_word(0)
+            if b2.button("😐 Hard", use_container_width=True): update_word(1)
+            if b3.button("😎 Easy", use_container_width=True): update_word(2)
     else:
-        st.success("🎉 No words to review!")
+        st.success("🎉 You are all caught up for today!")

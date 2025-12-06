@@ -4,7 +4,7 @@ import sqlite3
 import json
 import os
 import re
-import base64  # 新增：用于HTML音频播放
+import base64
 from datetime import datetime, timedelta
 from io import BytesIO
 from PIL import Image
@@ -13,7 +13,7 @@ from gtts import gTTS
 # ==========================================
 # 0. 基础配置
 # ==========================================
-st.set_page_config(page_title="AI Omni-Tutor V7.5 (Universal)", page_icon="🦄", layout="wide")
+st.set_page_config(page_title="AI Omni-Tutor V7.6 (Audio History)", page_icon="🦄", layout="wide")
 
 # ==========================================
 # 1. 数据库逻辑
@@ -34,13 +34,14 @@ def init_db():
 
 init_db()
 
+# 初始化 Session State
 if "messages" not in st.session_state: st.session_state.messages = []
 if "review_queue" not in st.session_state: st.session_state.review_queue = []
 if "show_answer" not in st.session_state: st.session_state.show_answer = False
 if "current_scenario" not in st.session_state: st.session_state.current_scenario = "Free Chat"
 
 # ==========================================
-# 2. 语音生成 (万能兼容版)
+# 2. 语音生成工具 (HTML播放器生成器)
 # ==========================================
 LANG_CODE_MAP = {
     "German": "de", "Spanish": "es", "English": "en", "French": "fr"
@@ -49,53 +50,55 @@ LANG_CODE_MAP = {
 def generate_audio_bytes(text, lang_name):
     """生成音频数据的 BytesIO 对象"""
     try:
+        # 只读取翻译前的外语部分，避免把中文翻译也读出来
+        # 简单的逻辑：读取第一行或者直到遇到翻译标记前的内容
+        speak_text = text.split("🇨🇳")[0].strip() # 避免读出后面的中文翻译
+        if not speak_text: speak_text = text
+
         lang_code = LANG_CODE_MAP.get(lang_name, "en")
-        if not text.strip(): return None
+        if not speak_text.strip(): return None
         
-        tts = gTTS(text=text, lang=lang_code, slow=False)
+        tts = gTTS(text=speak_text, lang=lang_code, slow=False)
         mp3_fp = BytesIO()
         tts.write_to_fp(mp3_fp)
         mp3_fp.seek(0)
         return mp3_fp
     except Exception as e:
-        return f"TTS Error: {str(e)}"
+        return None
 
-def play_audio_html(audio_fp):
+def make_audio_html(audio_fp, autoplay=False):
     """
-    【核心修复】使用 HTML 标签播放音频。
-    这种方法不依赖 Streamlit 版本，彻底解决 unexpected keyword argument 'key' 报错。
+    将音频数据转换为 HTML 字符串。
+    autoplay=True: 用于刚生成时自动播放
+    autoplay=False: 用于存入历史记录，避免刷新页面时所有历史语音同时炸响
     """
+    if not audio_fp: return ""
     try:
-        # 将音频转换为 base64 字符串
         b64 = base64.b64encode(audio_fp.getvalue()).decode()
-        # 构建 HTML 播放器，设置 autoplay
-        md = f"""
-            <audio controls autoplay style="width: 100%;">
+        autoplay_attr = "autoplay" if autoplay else ""
+        # 构建一个带有控件的 HTML 播放器
+        return f"""
+            <audio controls {autoplay_attr} style="width: 100%; margin-top: 5px;">
             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
             </audio>
         """
-        # 使用 unsafe_allow_html 渲染
-        st.markdown(md, unsafe_allow_html=True)
     except Exception as e:
-        st.error(f"Audio Playback Error: {e}")
+        return f"Audio Error: {e}"
 
 # ==========================================
-# 3. 工具函数
+# 3. 其他工具函数
 # ==========================================
-def clean_text_for_tts(text):
-    text = re.sub(r'\(.*?\)', '', text)
-    text = text.replace('**', '').replace('*', '').replace('`', '').replace('#', '')
-    return text.strip()
-
 def get_model():
-    # 保持使用 1.5-flash，它是目前最稳定的版本
+    # ⚠️ 修正：必须使用存在的模型版本
     return "models/gemini-2.5-flash" 
 
 def extract_and_save_vocab(text, lang, model):
     try:
+        # 优化 Prompt，让提取更精准
         prompt = f"""
-        Extract 3-5 key vocabulary words from this {lang} text.
-        Format JSON: [{{"word": "word1", "trans": "english_meaning"}}, ...]
+        Analyze this {lang} text. Identify 3-5 key vocabulary words.
+        Output ONLY a raw JSON list. 
+        Format: [{{"word": "ForeignWord", "trans": "EnglishTranslation"}}, ...]
         Text: {text}
         """
         resp = model.generate_content(prompt)
@@ -111,7 +114,9 @@ def extract_and_save_vocab(text, lang, model):
         data = json.loads(clean)
         conn = get_db_connection()
         today_dt = datetime.now()
-        next_review = (today_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # ⚠️ 修改：days=0，表示今天就可以复习！
+        next_review = today_dt.strftime("%Y-%m-%d")
         
         saved_words = []
         for item in data:
@@ -141,11 +146,9 @@ with st.sidebar:
         os.environ["GOOGLE_API_KEY"] = api_key
         genai.configure(api_key=api_key)
         try:
-            model_name = get_model()
-            model = genai.GenerativeModel(model_name)
-            st.caption(f"🚀 Running on: {model_name}")
-        except Exception as e:
-            st.error(f"Model Error: {e}")
+            model = genai.GenerativeModel(get_model())
+        except:
+            st.error("API Key Error or Model unavailable")
             st.stop()
     else:
         st.warning("Please setup API Key")
@@ -202,10 +205,14 @@ tab1, tab2, tab3 = st.tabs(["💬 Chat & Learn", "📸 Photo Learning", "🧠 Re
 with tab1:
     chat_container = st.container()
     
+    # 1. 渲染历史消息 (包含音频播放器)
     with chat_container:
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+                # 如果历史消息里有音频HTML，就显示出来
+                if "audio_html" in msg and msg["audio_html"]:
+                    st.markdown(msg["audio_html"], unsafe_allow_html=True)
         st.empty() 
 
     if user_input := st.chat_input(f"Type in {language}..."):
@@ -220,11 +227,17 @@ with tab1:
                 full_response = ""
                 
                 try:
+                    # === Prompt 修改: 强制要求翻译 ===
                     prompt = f"""
                     Act as a {scenarios[current_scenario]}. Language: {language} ({selected_level}).
                     User says: "{user_input}".
-                    Reply naturally (2-3 sentences). 
-                    Then, if the user made grammar mistakes, list them briefly at the very end inside (parentheses).
+                    
+                    Structure your reply exactly like this:
+                    1. Natural reply in {language} (2-3 sentences).
+                    2. New line.
+                    3. "🇨🇳 Translation: " followed by the Chinese translation.
+                    4. New line.
+                    5. If user made grammar mistakes, list corrections inside (parentheses).
                     """
                     
                     response = model.generate_content(prompt, stream=True)
@@ -235,21 +248,31 @@ with tab1:
                             placeholder.markdown(full_response + "▌")
                     placeholder.markdown(full_response)
                     
-                    st.session_state.messages.append({"role": "assistant", "content": full_response})
-
-                    # === 语音生成 (HTML版) ===
-                    clean_txt = clean_text_for_tts(full_response)
-                    audio_data = generate_audio_bytes(clean_txt, language)
+                    # === 音频生成与保存逻辑 ===
+                    # 1. 生成音频数据
+                    audio_bytes = generate_audio_bytes(full_response, language)
                     
-                    if isinstance(audio_data, str):
-                        st.error(audio_data)
-                    elif audio_data:
-                        # 使用自定义函数播放，不再调用 st.audio
-                        play_audio_html(audio_data)
+                    # 2. 生成两种 HTML 播放器代码
+                    #    - audio_html_autoplay: 用于刚才这一刻自动播放
+                    #    - audio_html_store: 用于存入历史记录 (不自动播放)
+                    audio_html_autoplay = make_audio_html(audio_bytes, autoplay=True)
+                    audio_html_store = make_audio_html(audio_bytes, autoplay=False)
+                    
+                    # 3. 立即播放
+                    if audio_html_autoplay:
+                        st.markdown(audio_html_autoplay, unsafe_allow_html=True)
+                    
+                    # 4. 将消息和音频HTML存入 Session State
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": full_response,
+                        "audio_html": audio_html_store # 存入不带自动播放的HTML
+                    })
 
+                    # 5. 存词
                     new_words = extract_and_save_vocab(full_response, language, model)
                     if new_words:
-                        st.toast(f"💾 Saved: {', '.join(new_words)}", icon="🧠")
+                        st.toast(f"💾 Saved for Review: {', '.join(new_words)}", icon="🧠")
 
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -264,14 +287,18 @@ with tab2:
         if st.button("🔍 Analyze Photo"):
             with st.spinner("🤖 Analyzing..."):
                 try:
-                    prompt = f"Describe this image in {language} (Level {selected_level}) and list 3 key vocabulary words."
+                    prompt = f"""
+                    Describe this image in {language} (Level {selected_level}).
+                    Then provide a Chinese translation starting with "🇨🇳 Translation:".
+                    Finally list 3 key vocabulary words.
+                    """
                     response = model.generate_content([prompt, image])
                     st.markdown(response.text)
                     
-                    clean_txt = clean_text_for_tts(response.text)
-                    audio_data = generate_audio_bytes(clean_txt, language)
-                    if isinstance(audio_data, BytesIO):
-                         play_audio_html(audio_data)
+                    audio_bytes = generate_audio_bytes(response.text, language)
+                    if audio_bytes:
+                         html = make_audio_html(audio_bytes, autoplay=False)
+                         st.markdown(html, unsafe_allow_html=True)
                     
                     extract_and_save_vocab(response.text, language, model)
                 except Exception as e:
@@ -290,6 +317,7 @@ with tab3:
         conn = get_db_connection()
         today_str = datetime.now().strftime("%Y-%m-%d")
         try:
+            # 修改查询逻辑：只要是今天之前的，或者是NULL的都查出来
             rows = conn.cursor().execute(
                 "SELECT word, translation, proficiency FROM vocab WHERE language=? AND (next_review_date <= ? OR next_review_date IS NULL) ORDER BY random() LIMIT 10", 
                 (language, today_str)).fetchall()
@@ -311,8 +339,8 @@ with tab3:
         with c1:
             if st.button("🔊 Pronounce", key=f"btn_{word}"):
                 res = generate_audio_bytes(word, language)
-                if isinstance(res, BytesIO): 
-                     play_audio_html(res)
+                if res: 
+                     st.markdown(make_audio_html(res, autoplay=True), unsafe_allow_html=True)
 
         with c2:
             if st.button("👀 Reveal"):
@@ -345,4 +373,4 @@ with tab3:
             if b2.button("😐 Hard", use_container_width=True): update_word(1)
             if b3.button("😎 Easy", use_container_width=True): update_word(2)
     else:
-        st.success("🎉 You are all caught up!")
+        st.success("🎉 You are all caught up! (Chat more to get new words)")
